@@ -12,6 +12,8 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer, AutoConfig, AutoModel, RobertaTokenizer, RobertaModel, get_linear_schedule_with_warmup, T5ForConditionalGeneration
 import warnings
 import sklearn.exceptions
+import os
+import argparse
 
 warnings.filterwarnings("ignore", category=sklearn.exceptions.UndefinedMetricWarning)
 
@@ -149,17 +151,55 @@ def evaluate(eval_dataloader, model, device):
         'execution_time': execution_time
     }
 
+def save_checkpoint(path, epoch, model, optimizer, best_metrics):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_metrics': best_metrics
+    }, path)
+
+    logger.info(f"Checkpoint saved at epoch {epoch+1}: {path}")
+
+def load_checkpoint(path, model, optimizer, device):
+    if not os.path.exists(path):
+        logger.info("No checkpoint found. Training from scratch.")
+        return 0, {}
+
+    logger.info(f"Loading checkpoint from {path}")
+
+    checkpoint = torch.load(path, map_location=device)
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    start_epoch = checkpoint['epoch'] + 1
+    best_metrics = checkpoint.get('best_metrics', {})
+
+    logger.info(f"Resuming from epoch {start_epoch}")
+
+    return start_epoch, best_metrics
+
 def main():
+
+    parser = argparse.ArgumentParser(description='VulDet training.')
+    parser.add_argument('-p', '--checkpoint_dir', help='The dir path of checkpoint.', type=str, required=True)
+    args = parser.parse_args()
+
     epochs = 100
     batchsize = 4
     #set_seed(42)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    code_model = 'model/models--Salesforce--codet5p-110m-embedding/snapshots/d9f3a534af4252f04b10cd9f78e05037542d10f6'
-    text_model = 'model/models--roberta-base/snapshots/e2da8e2f811d1448a5b465c236feacd80ffbac7b'
-    code_tokenizer = AutoTokenizer.from_pretrained(code_model, trust_remote_code=True)
-    code_model = AutoModel.from_pretrained(code_model, trust_remote_code=True)
-    text_tokenizer = RobertaTokenizer.from_pretrained(text_model)
-    text_model = RobertaModel.from_pretrained(text_model)
+
+    code_model_name = "Salesforce/codet5p-110m-embedding"
+    text_model_name = "roberta-base"
+
+    code_tokenizer = AutoTokenizer.from_pretrained(code_model_name, trust_remote_code=True)
+    code_model = AutoModel.from_pretrained(code_model_name, trust_remote_code=True)
+    text_tokenizer = RobertaTokenizer.from_pretrained(text_model_name)
+    text_model = RobertaModel.from_pretrained(text_model_name)
     #model = Code_Note(code_model, text_model, 1536, 3072, 384)
     model = Code_Note(code_model, text_model, 768, 1536, 384)
     model.to(device)
@@ -169,9 +209,19 @@ def main():
     eval_codefile = '../data/devign/devign_val.csv'
     eval_textfile = '../data/devign/ss_val.csv'
 
+    checkpoint_dir = args.checkpoint_dir
+    latest_ckpt = os.path.join(checkpoint_dir, "latest.pt")
+    best_ckpt = os.path.join(checkpoint_dir, "best.pt")
+
     # 定义损失函数和优化器
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=2e-6)
+
+
+    # ===== LOAD CHECKPOINT IF EXISTS =====
+    start_epoch, best_metrics = load_checkpoint(
+        latest_ckpt, model, optimizer, device
+    )
 
     #读取代码和注释(训练部分)
     examples = read_file(train_codefile, train_textfile)
@@ -182,6 +232,8 @@ def main():
     all_inputs_text_ids = torch.tensor([f.inputs_text_ids for f in train_examples])
     all_inputs_text_masks = torch.tensor([f.inputs_text_masks for f in train_examples])
     all_inputs_labels = torch.tensor([f.label for f in train_examples])
+    print(torch.bincount(all_inputs_labels))
+
     train_data = TensorDataset(all_inputs_code_ids, all_inputs_code_masks, all_inputs_text_ids, all_inputs_text_masks, all_inputs_labels)
     train_dataloader = DataLoader(train_data, batch_size=batchsize, shuffle=True)
 
@@ -201,11 +253,14 @@ def main():
     # 学习率预热
     #scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=(epochs * len(train_dataloader)) * 0.1, num_training_steps=(epochs * len(train_dataloader)))
 
-    best_metrics = {}
-    best_epoch = 0
+    best_epoch = start_epoch
+
+    if best_metrics == {}:
+        best_metrics = {'acc': 0}
+
     with open("result.txt", "a") as f:
         # 迭代学习次数
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             train_total_lose = 0.0
             train_total_correct = 0.0
             train_total_examples = 0.0
@@ -216,7 +271,8 @@ def main():
                 inputs_code_id, inputs_code_mask, inputs_text_id, inputs_text_mask, inputs_label = batch[0].to(device), batch[1].to(device), batch[2].to(device), batch[3].to(device), batch[4].to(device)
                 optimizer.zero_grad()
                 mlp_output = model(inputs_code_id, inputs_code_mask, inputs_text_id, inputs_text_mask)
-                # print(mlp_output)
+                #print("mlp_output:", mlp_output.shape)
+                #print("inputs_label:", inputs_label.shape, inputs_label.dtype)
                 loss = criterion(mlp_output, inputs_label)
                 loss.backward()
                 optimizer.step()
@@ -248,12 +304,26 @@ def main():
                 if eval_acc >= best_metrics['acc']:
                     best_metrics = metrics
                     best_epoch = epoch
+                    save_checkpoint(
+                        best_ckpt,
+                        epoch,
+                        model,
+                        optimizer,
+                        best_metrics
+                    )
             best_acc = best_metrics['acc']
             best_f1 = best_metrics['f1']
             best_rec = best_metrics['rec']
             best_prec = best_metrics['prec']
             print('---best epoch---')
             print(f'best epcoch: {best_epoch+1}    acc={best_acc}, f1={best_f1}, recall={best_rec}, precision={best_prec}')
+            save_checkpoint(
+                latest_ckpt,
+                epoch,
+                model,
+                optimizer,
+                best_metrics
+            )
 
 
 
